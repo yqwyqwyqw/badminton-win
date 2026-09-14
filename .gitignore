@@ -1,0 +1,15 @@
+.tools/
+validation-output/
+
+.venv*/
+__pycache__/
+*.py[cod]
+
+build/
+cmake-build-*/
+out/
+CMakeUserPresets.json
+.idea/
+.vscode/
+.DS_Store
+aqtinstall.log
