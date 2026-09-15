@@ -26,6 +26,19 @@ TrialAnalysisController::TrialAnalysisController(QObject *parent)
         if (error == QProcess::FailedToStart)
             fail(QStringLiteral("无法启动处理程序：%1").arg(m_process.errorString()));
     });
+    connect(&m_exportProcess, &QProcess::readyReadStandardOutput,
+            this, &TrialAnalysisController::readExportOutput);
+    connect(&m_exportProcess, &QProcess::readyReadStandardError, this, [this]() {
+        appendLog(QString::fromUtf8(m_exportProcess.readAllStandardError()));
+    });
+    connect(&m_exportProcess, &QProcess::finished,
+            this, &TrialAnalysisController::exportFinished);
+    connect(&m_exportProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) {
+            m_actionMessage = QStringLiteral("无法启动导出程序：%1").arg(m_exportProcess.errorString());
+            emit changed();
+        }
+    });
 
     m_refreshTimer.setInterval(500);
     connect(&m_refreshTimer, &QTimer::timeout, this, &TrialAnalysisController::refreshFiles);
@@ -41,8 +54,51 @@ QUrl TrialAnalysisController::proxyUrl() const
     return proxyReady() ? QUrl::fromLocalFile(m_proxyPath) : QUrl();
 }
 
+void TrialAnalysisController::prepareSource(
+    const QString &sourcePath, qint64 sourceDurationMs, int sourceWidth, int sourceHeight)
+{
+    if (running())
+        return;
+    const QFileInfo source(sourcePath);
+    if (!source.exists() || !source.isFile())
+        return;
+
+    m_sourcePath = source.absoluteFilePath();
+    m_sourceDurationMs = sourceDurationMs;
+    m_sourceWidth = sourceWidth;
+    m_sourceHeight = sourceHeight;
+    const QString previousOutputDirectory = m_outputDirectory;
+    configurePaths(m_sourcePath);
+    if (m_outputDirectory != previousOutputDirectory) {
+        m_rallies.clear();
+        m_etaText.clear();
+        m_progress = 0.0;
+        emit changed();
+    }
+    m_maxRallies = 0;
+    loadProgress();
+    loadRallies();
+}
+
 void TrialAnalysisController::startTrial(
-    const QString &sourcePath, qint64 sourceDurationMs, int maxRallies)
+    const QString &sourcePath, qint64 sourceDurationMs,
+    int sourceWidth, int sourceHeight, int maxRallies)
+{
+    beginAnalysis(
+        sourcePath, sourceDurationMs, sourceWidth, sourceHeight,
+        qBound(1, maxRallies, 10), false);
+}
+
+void TrialAnalysisController::startFullAnalysis(
+    const QString &sourcePath, qint64 sourceDurationMs,
+    int sourceWidth, int sourceHeight)
+{
+    beginAnalysis(sourcePath, sourceDurationMs, sourceWidth, sourceHeight, 0, true);
+}
+
+void TrialAnalysisController::beginAnalysis(
+    const QString &sourcePath, qint64 sourceDurationMs,
+    int sourceWidth, int sourceHeight, int maxRallies, bool fullAnalysis)
 {
     if (running())
         return;
@@ -54,7 +110,10 @@ void TrialAnalysisController::startTrial(
 
     m_sourcePath = source.absoluteFilePath();
     m_sourceDurationMs = sourceDurationMs;
-    m_maxRallies = qBound(1, maxRallies, 10);
+    m_sourceWidth = sourceWidth;
+    m_sourceHeight = sourceHeight;
+    m_maxRallies = maxRallies;
+    m_fullAnalysis = fullAnalysis;
     m_progress = 0.0;
     m_errorMessage.clear();
     m_actionMessage.clear();
@@ -81,7 +140,7 @@ void TrialAnalysisController::startTrial(
     QDir().mkpath(m_outputDirectory);
     QDir().mkpath(m_analysisDirectory);
     loadRallies();
-    if (m_rallies.size() >= m_maxRallies) {
+    if (m_maxRallies > 0 && m_rallies.size() >= m_maxRallies) {
         m_stage = Stage::Complete;
         m_state = QStringLiteral("complete");
         m_progress = 1.0;
@@ -125,6 +184,7 @@ void TrialAnalysisController::reset()
     m_errorMessage.clear();
     m_actionMessage.clear();
     m_progress = 0.0;
+    m_fullAnalysis = false;
     m_rallies.clear();
     emit changed();
 }
@@ -137,32 +197,252 @@ QUrl TrialAnalysisController::clipUrl(int index) const
     return QFileInfo::exists(path) ? QUrl::fromLocalFile(path) : QUrl();
 }
 
-bool TrialAnalysisController::exportRally(int index, const QUrl &folderUrl)
+bool TrialAnalysisController::exportRally(
+    int index, const QUrl &folderUrl, const QString &quality)
 {
+    if (exporting()) {
+        m_actionMessage = QStringLiteral("已有一个回合正在导出");
+        emit changed();
+        return false;
+    }
     if (index < 0 || index >= m_rallies.size() || !folderUrl.isLocalFile())
         return false;
-    const QString sourcePath = m_rallies.at(index).toMap()
-                                   .value(QStringLiteral("clipPath")).toString();
-    const QFileInfo source(sourcePath);
+    const QVariantMap rally = m_rallies.at(index).toMap();
+    const QString clipPath = rally.value(QStringLiteral("clipPath")).toString();
+    const QFileInfo clip(clipPath);
     QDir folder(folderUrl.toLocalFile());
-    if (!source.exists() || !folder.exists()) {
+    if (!folder.exists() || !QFileInfo::exists(m_sourcePath)) {
         m_actionMessage = QStringLiteral("导出失败：源短片或目标文件夹不存在");
         emit changed();
         return false;
     }
 
-    QString destination = folder.filePath(source.fileName());
+    const QString qualityName = quality == QStringLiteral("source")
+        ? QStringLiteral("original") : quality;
+    const int rallyNumber = rally.value(QStringLiteral("rally"), index + 1).toInt();
+    const QString baseName = QStringLiteral("rally-%1-%2")
+                                 .arg(rallyNumber, 4, 10, QLatin1Char('0'))
+                                 .arg(qualityName);
+    QString destination = folder.filePath(baseName + QStringLiteral(".mp4"));
     int suffix = 2;
     while (QFileInfo::exists(destination)) {
-        destination = folder.filePath(
-            QStringLiteral("%1-%2.%3").arg(source.completeBaseName()).arg(suffix++).arg(source.suffix()));
+        destination = folder.filePath(QStringLiteral("%1-%2.mp4").arg(baseName).arg(suffix++));
     }
-    const bool copied = QFile::copy(source.absoluteFilePath(), destination);
-    m_actionMessage = copied
-        ? QStringLiteral("已导出：%1").arg(QDir::toNativeSeparators(destination))
-        : QStringLiteral("导出失败：无法复制文件");
+
+    if (quality == QStringLiteral("720p") && m_sourceHeight >= 720 && clip.exists()) {
+        const bool copied = QFile::copy(clip.absoluteFilePath(), destination);
+        m_actionMessage = copied
+            ? QStringLiteral("已导出 720p 快速版：%1").arg(QDir::toNativeSeparators(destination))
+            : QStringLiteral("导出失败：无法复制短片");
+        m_exportProgress = copied ? 1.0 : 0.0;
+        emit changed();
+        return copied;
+    }
+
+    const double start = qMax(0.0, rally.value(QStringLiteral("startSeconds")).toDouble() - 0.5);
+    const double end = rally.value(QStringLiteral("endSeconds")).toDouble() + 0.8;
+    const double duration = qMax(0.1, end - start);
+    m_exportDurationMs = qRound64(duration * 1000.0);
+    m_exportProgress = 0.0;
+    m_logTail.clear();
+    m_exportFinalPath = destination;
+    m_exportTemporaryPath = folder.filePath(baseName + QStringLiteral(".part.mp4"));
+    QFile::remove(m_exportTemporaryPath);
+
+    QStringList arguments = {
+        QStringLiteral("-hide_banner"), QStringLiteral("-y"), QStringLiteral("-nostdin"),
+        QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-progress"), QStringLiteral("pipe:1"),
+        QStringLiteral("-ss"), QString::number(start, 'f', 3),
+        QStringLiteral("-i"), m_sourcePath,
+        QStringLiteral("-t"), QString::number(duration, 'f', 3),
+        QStringLiteral("-map"), QStringLiteral("0:v:0"),
+        QStringLiteral("-map"), QStringLiteral("0:a:0?")
+    };
+    if (quality == QStringLiteral("1080p") && m_sourceHeight > 1080)
+        arguments << QStringLiteral("-vf") << QStringLiteral("scale=-2:1080:flags=lanczos");
+    else if (quality == QStringLiteral("720p") && m_sourceHeight > 720)
+        arguments << QStringLiteral("-vf") << QStringLiteral("scale=-2:720:flags=lanczos");
+
+    arguments << QStringLiteral("-c:v") << QStringLiteral("libx264")
+              << QStringLiteral("-preset") << QStringLiteral("fast")
+              << QStringLiteral("-crf")
+              << (quality == QStringLiteral("source") ? QStringLiteral("16") : QStringLiteral("18"))
+              << QStringLiteral("-c:a") << QStringLiteral("aac")
+              << QStringLiteral("-b:a") << QStringLiteral("192k")
+              << QStringLiteral("-movflags") << QStringLiteral("+faststart")
+              << m_exportTemporaryPath;
+
+    m_actionMessage = quality == QStringLiteral("source")
+        ? QStringLiteral("正在按原始分辨率导出最高质量版本…")
+        : QStringLiteral("正在导出 %1 版本…").arg(quality);
+    m_exportProcess.setWorkingDirectory(m_projectRoot);
+    m_exportProcess.setProgram(m_ffmpegPath);
+    m_exportProcess.setArguments(arguments);
+    m_exportProcess.start();
     emit changed();
-    return copied;
+    return true;
+}
+
+bool TrialAnalysisController::exportAssembly(
+    const QVariantList &rows, const QUrl &folderUrl,
+    const QString &quality, const QString &baseName)
+{
+    if (exporting()) {
+        m_actionMessage = QStringLiteral("已有一个视频正在导出");
+        emit changed();
+        return false;
+    }
+    if (rows.isEmpty() || !folderUrl.isLocalFile() || !QFileInfo::exists(m_sourcePath)) {
+        m_actionMessage = QStringLiteral("导出失败：没有可拼接回合或源视频不存在");
+        emit changed();
+        return false;
+    }
+
+    QDir folder(folderUrl.toLocalFile());
+    if (!folder.exists()) {
+        m_actionMessage = QStringLiteral("导出失败：目标文件夹不存在");
+        emit changed();
+        return false;
+    }
+
+    QVariantList validRows;
+    qint64 totalDurationMs = 0;
+    const double sourceDuration = qMax(0.1, m_sourceDurationMs / 1000.0);
+    for (const QVariant &value : rows) {
+        const QVariantMap row = value.toMap();
+        if (!row.value(QStringLiteral("selected")).toBool())
+            continue;
+        const double start = qBound(0.0, row.value(QStringLiteral("startSeconds")).toDouble(), sourceDuration);
+        const double end = qBound(0.0, row.value(QStringLiteral("endSeconds")).toDouble(), sourceDuration);
+        if (end <= start + 0.05)
+            continue;
+        QVariantMap normalized = row;
+        normalized.insert(QStringLiteral("startSeconds"), start);
+        normalized.insert(QStringLiteral("endSeconds"), end);
+        validRows.append(normalized);
+        totalDurationMs += qRound64((end - start) * 1000.0);
+    }
+    if (validRows.isEmpty()) {
+        m_actionMessage = QStringLiteral("导出失败：请至少保留一个有效回合");
+        emit changed();
+        return false;
+    }
+
+    QString safeBaseName = baseName.trimmed();
+    if (safeBaseName.isEmpty())
+        safeBaseName = QStringLiteral("羽毛球回合合集");
+    safeBaseName.replace(QRegularExpression(QStringLiteral(R"([\\/:*?"<>|]+)")), QStringLiteral("_"));
+    safeBaseName = safeBaseName.left(80);
+    const QString qualityName = quality == QStringLiteral("source")
+        ? QStringLiteral("original") : quality;
+    const QString fileStem = safeBaseName + QStringLiteral("-") + qualityName;
+    QString destination = folder.filePath(fileStem + QStringLiteral(".mp4"));
+    int suffix = 2;
+    while (QFileInfo::exists(destination))
+        destination = folder.filePath(QStringLiteral("%1-%2.mp4").arg(fileStem).arg(suffix++));
+
+    // Probe once so videos without an audio stream can still be concatenated.
+    bool hasAudio = true;
+    const QString ffprobePath = QFileInfo(m_ffmpegPath).dir().filePath(QStringLiteral("ffprobe.exe"));
+    if (QFileInfo::exists(ffprobePath)) {
+        QProcess probe;
+        probe.setProgram(ffprobePath);
+        probe.setArguments({
+            QStringLiteral("-v"), QStringLiteral("error"),
+            QStringLiteral("-select_streams"), QStringLiteral("a:0"),
+            QStringLiteral("-show_entries"), QStringLiteral("stream=index"),
+            QStringLiteral("-of"), QStringLiteral("csv=p=0"), m_sourcePath
+        });
+        probe.start();
+        if (probe.waitForFinished(3000))
+            hasAudio = !QString::fromUtf8(probe.readAllStandardOutput()).trimmed().isEmpty();
+    }
+
+    const int count = validRows.size();
+    QStringList filterParts;
+    QStringList videoSources;
+    for (int i = 0; i < count; ++i)
+        videoSources << QStringLiteral("[vsrc%1]").arg(i);
+    filterParts << QStringLiteral("[0:v:0]split=%1%2")
+                       .arg(count).arg(videoSources.join(QString()));
+
+    QStringList audioSources;
+    if (hasAudio) {
+        for (int i = 0; i < count; ++i)
+            audioSources << QStringLiteral("[asrc%1]").arg(i);
+        filterParts << QStringLiteral("[0:a:0]asplit=%1%2")
+                           .arg(count).arg(audioSources.join(QString()));
+    }
+
+    QStringList concatInputs;
+    for (int i = 0; i < count; ++i) {
+        const QVariantMap row = validRows.at(i).toMap();
+        const QString start = QString::number(row.value(QStringLiteral("startSeconds")).toDouble(), 'f', 3);
+        const QString end = QString::number(row.value(QStringLiteral("endSeconds")).toDouble(), 'f', 3);
+        filterParts << QStringLiteral("[vsrc%1]trim=start=%2:end=%3,setpts=PTS-STARTPTS[v%1]")
+                           .arg(i).arg(start).arg(end);
+        concatInputs << QStringLiteral("[v%1]").arg(i);
+        if (hasAudio) {
+            filterParts << QStringLiteral("[asrc%1]atrim=start=%2:end=%3,asetpts=PTS-STARTPTS[a%1]")
+                               .arg(i).arg(start).arg(end);
+            concatInputs << QStringLiteral("[a%1]").arg(i);
+        }
+    }
+    if (hasAudio) {
+        filterParts << concatInputs.join(QString())
+                           + QStringLiteral("concat=n=%1:v=1:a=1[vcat][acat]").arg(count);
+    } else {
+        filterParts << concatInputs.join(QString())
+                           + QStringLiteral("concat=n=%1:v=1:a=0[vcat]").arg(count);
+    }
+
+    QString videoLabel = QStringLiteral("[vcat]");
+    if (quality == QStringLiteral("1080p") && m_sourceHeight > 1080) {
+        filterParts << QStringLiteral("[vcat]scale=-2:1080:flags=lanczos[vout]");
+        videoLabel = QStringLiteral("[vout]");
+    } else if (quality == QStringLiteral("720p") && m_sourceHeight > 720) {
+        filterParts << QStringLiteral("[vcat]scale=-2:720:flags=lanczos[vout]");
+        videoLabel = QStringLiteral("[vout]");
+    }
+
+    m_exportDurationMs = totalDurationMs;
+    m_exportProgress = 0.0;
+    m_logTail.clear();
+    m_exportFinalPath = destination;
+    m_exportTemporaryPath = folder.filePath(fileStem + QStringLiteral(".part.mp4"));
+    QFile::remove(m_exportTemporaryPath);
+
+    QStringList arguments = {
+        QStringLiteral("-hide_banner"), QStringLiteral("-y"), QStringLiteral("-nostdin"),
+        QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-progress"), QStringLiteral("pipe:1"),
+        QStringLiteral("-i"), m_sourcePath,
+        QStringLiteral("-filter_complex"), filterParts.join(QStringLiteral(";")),
+        QStringLiteral("-map"), videoLabel
+    };
+    if (hasAudio)
+        arguments << QStringLiteral("-map") << QStringLiteral("[acat]");
+    arguments << QStringLiteral("-c:v") << QStringLiteral("libx264")
+              << QStringLiteral("-preset") << QStringLiteral("fast")
+              << QStringLiteral("-crf")
+              << (quality == QStringLiteral("source") ? QStringLiteral("16") : QStringLiteral("18"))
+              << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p");
+    if (hasAudio)
+        arguments << QStringLiteral("-c:a") << QStringLiteral("aac")
+                  << QStringLiteral("-b:a") << QStringLiteral("192k")
+                  << QStringLiteral("-shortest");
+    arguments << QStringLiteral("-movflags") << QStringLiteral("+faststart")
+              << m_exportTemporaryPath;
+
+    m_actionMessage = QStringLiteral("正在拼接 %1 个回合并导出 %2 版本…")
+                          .arg(validRows.size()).arg(qualityName);
+    m_exportProcess.setWorkingDirectory(m_projectRoot);
+    m_exportProcess.setProgram(m_ffmpegPath);
+    m_exportProcess.setArguments(arguments);
+    m_exportProcess.start();
+    emit changed();
+    return true;
 }
 
 void TrialAnalysisController::openOutputFolder() const
@@ -251,7 +531,9 @@ void TrialAnalysisController::startInference()
     m_stage = Stage::Inference;
     m_state = QStringLiteral("inference");
     m_progress = 0.0;
-    m_stageText = QStringLiteral("TrackNet 正在识别前 %1 个回合").arg(m_maxRallies);
+    m_stageText = m_fullAnalysis
+        ? QStringLiteral("TrackNet 正在分析完整视频")
+        : QStringLiteral("TrackNet 正在识别前 %1 个回合").arg(m_maxRallies);
     m_detailText = QStringLiteral("每识别完一个完整回合，就会立即出现在右侧");
 
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
@@ -262,7 +544,7 @@ void TrialAnalysisController::startInference()
             ? m_vendorPath
             : m_vendorPath + QDir::listSeparator() + existingPythonPath);
 
-    const QStringList arguments = {
+    QStringList arguments = {
         m_runnerPath,
         QStringLiteral("--video"), m_proxyPath,
         QStringLiteral("--tracknet-file"), m_modelPath,
@@ -271,9 +553,10 @@ void TrialAnalysisController::startInference()
         QStringLiteral("--overlap-seconds"), QStringLiteral("0.5"),
         QStringLiteral("--batch-size"), QStringLiteral("8"),
         QStringLiteral("--eval-mode"), QStringLiteral("nonoverlap"),
-        QStringLiteral("--max-rallies"), QString::number(m_maxRallies),
         QStringLiteral("--ffmpeg"), m_ffmpegPath
     };
+    if (m_maxRallies > 0)
+        arguments << QStringLiteral("--max-rallies") << QString::number(m_maxRallies);
 
     m_process.setWorkingDirectory(m_projectRoot);
     m_process.setProcessEnvironment(environment);
@@ -294,6 +577,42 @@ void TrialAnalysisController::readProcessOutput()
 void TrialAnalysisController::readProcessError()
 {
     appendLog(QString::fromUtf8(m_process.readAllStandardError()));
+}
+
+void TrialAnalysisController::readExportOutput()
+{
+    const QString output = QString::fromUtf8(m_exportProcess.readAllStandardOutput());
+    for (const QString &line : output.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        if (!line.startsWith(QStringLiteral("out_time_")) || m_exportDurationMs <= 0)
+            continue;
+        const qsizetype equals = line.indexOf(QLatin1Char('='));
+        bool ok = false;
+        const qint64 microseconds = line.mid(equals + 1).toLongLong(&ok);
+        if (ok)
+            m_exportProgress = qBound(0.0, microseconds / 1000.0 / m_exportDurationMs, 0.99);
+    }
+    emit changed();
+}
+
+void TrialAnalysisController::exportFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    const bool succeeded = exitStatus == QProcess::NormalExit && exitCode == 0;
+    if (!succeeded) {
+        QFile::remove(m_exportTemporaryPath);
+        m_exportProgress = 0.0;
+        m_actionMessage = QStringLiteral("回合导出失败：%1").arg(m_logTail.right(600));
+        emit changed();
+        return;
+    }
+    if (!QFile::rename(m_exportTemporaryPath, m_exportFinalPath)) {
+        m_exportProgress = 0.0;
+        m_actionMessage = QStringLiteral("导出完成，但无法写入目标文件");
+        emit changed();
+        return;
+    }
+    m_exportProgress = 1.0;
+    m_actionMessage = QStringLiteral("已导出：%1").arg(QDir::toNativeSeparators(m_exportFinalPath));
+    emit changed();
 }
 
 void TrialAnalysisController::processLine(const QString &line)
@@ -368,7 +687,9 @@ void TrialAnalysisController::processFinished(int exitCode, QProcess::ExitStatus
         m_progress = 1.0;
         m_etaText.clear();
         m_stageText = QStringLiteral("切分试验完成");
-        m_detailText = QStringLiteral("已生成 %1 个可预览回合").arg(m_rallies.size());
+        m_detailText = m_fullAnalysis
+            ? QStringLiteral("完整视频分析完成，共识别 %1 个回合").arg(m_rallies.size())
+            : QStringLiteral("已生成 %1 个可预览回合").arg(m_rallies.size());
         m_refreshTimer.stop();
         emit changed();
     }
@@ -392,6 +713,26 @@ void TrialAnalysisController::loadProgress()
         m_progress = qBound(0.0, object.value(QStringLiteral("percent")).toDouble() / 100.0, 1.0);
     const double eta = object.value(QStringLiteral("etaSeconds")).toDouble(-1);
     m_etaText = eta >= 0 ? QStringLiteral("预计剩余 %1").arg(formatSeconds(eta)) : QString();
+    if (!running()) {
+        const QString status = object.value(QStringLiteral("status")).toString();
+        if (status == QStringLiteral("complete")) {
+            m_stage = Stage::Complete;
+            m_state = QStringLiteral("complete");
+            m_stageText = QStringLiteral("已恢复完整分析结果");
+            m_detailText = QStringLiteral("可以继续查看和导出回合");
+        } else if (status == QStringLiteral("paused") || status == QStringLiteral("running")) {
+            m_stage = Stage::Paused;
+            m_state = QStringLiteral("paused");
+            m_stageText = QStringLiteral("已恢复上次分析进度");
+            m_detailText = QStringLiteral("点击继续即可从已完成分块恢复");
+            m_etaText.clear();
+        } else if (status == QStringLiteral("sample_complete")) {
+            m_stage = Stage::Complete;
+            m_state = QStringLiteral("complete");
+            m_stageText = QStringLiteral("已恢复切分试验结果");
+            m_detailText = QStringLiteral("可继续分析完整视频");
+        }
+    }
     emit changed();
 }
 
@@ -407,7 +748,7 @@ void TrialAnalysisController::loadRallies()
 
     QVariantList loaded;
     for (const QJsonValue &value : document.array()) {
-        if (loaded.size() >= m_maxRallies)
+        if (m_maxRallies > 0 && loaded.size() >= m_maxRallies)
             break;
         QVariantMap rally = value.toObject().toVariantMap();
         const QString clipPath = rally.value(QStringLiteral("clip")).toString();
@@ -422,8 +763,10 @@ void TrialAnalysisController::loadRallies()
     }
     if (loaded != m_rallies) {
         m_rallies = loaded;
-        m_detailText = QStringLiteral("已发现 %1 / %2 个回合")
-                           .arg(m_rallies.size()).arg(m_maxRallies);
+        m_detailText = m_maxRallies > 0
+            ? QStringLiteral("已发现 %1 / %2 个回合")
+                  .arg(m_rallies.size()).arg(m_maxRallies)
+            : QStringLiteral("已识别 %1 个回合").arg(m_rallies.size());
         emit changed();
     }
 }
@@ -432,7 +775,9 @@ void TrialAnalysisController::fail(const QString &message)
 {
     m_stage = Stage::Error;
     m_state = QStringLiteral("error");
-    m_stageText = QStringLiteral("切分试验未完成");
+    m_stageText = m_fullAnalysis
+        ? QStringLiteral("完整分析未完成")
+        : QStringLiteral("切分试验未完成");
     m_errorMessage = message;
     m_refreshTimer.stop();
     emit changed();

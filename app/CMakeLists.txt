@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(BadmintonAnalyzer VERSION 0.0.2 LANGUAGES CXX)
+project(BadmintonAnalyzer VERSION 0.0.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,7 +31,10 @@ qt_add_qml_module(badminton-analyzer
         qml/Theme.qml
         qml/components/AppHeader.qml
         qml/components/CutTrialPanel.qml
+        qml/components/RallyAssemblyPanel.qml
+        qml/components/RallyLibraryPanel.qml
         qml/components/TrialRallyPanel.qml
+        qml/components/VideoExportPanel.qml
         qml/components/VideoImportPanel.qml
         qml/components/StepNavigation.qml
         qml/components/AnalysisStatusCard.qml

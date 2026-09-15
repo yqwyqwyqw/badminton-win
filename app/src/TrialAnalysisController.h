@@ -12,6 +12,9 @@ class TrialAnalysisController final : public QObject
     Q_PROPERTY(bool running READ running NOTIFY changed)
     Q_PROPERTY(bool hasResults READ hasResults NOTIFY changed)
     Q_PROPERTY(bool proxyReady READ proxyReady NOTIFY changed)
+    Q_PROPERTY(bool fullAnalysis READ fullAnalysis NOTIFY changed)
+    Q_PROPERTY(bool exporting READ exporting NOTIFY changed)
+    Q_PROPERTY(double exportProgress READ exportProgress NOTIFY changed)
     Q_PROPERTY(double progress READ progress NOTIFY changed)
     Q_PROPERTY(QString state READ state NOTIFY changed)
     Q_PROPERTY(QString stageText READ stageText NOTIFY changed)
@@ -30,6 +33,9 @@ public:
     bool running() const { return m_process.state() != QProcess::NotRunning; }
     bool hasResults() const { return !m_rallies.isEmpty(); }
     bool proxyReady() const;
+    bool fullAnalysis() const { return m_fullAnalysis; }
+    bool exporting() const { return m_exportProcess.state() != QProcess::NotRunning; }
+    double exportProgress() const { return m_exportProgress; }
     double progress() const { return m_progress; }
     QString state() const { return m_state; }
     QString stageText() const { return m_stageText; }
@@ -42,11 +48,21 @@ public:
     QVariantList rallies() const { return m_rallies; }
     QUrl proxyUrl() const;
 
-    Q_INVOKABLE void startTrial(const QString &sourcePath, qint64 sourceDurationMs, int maxRallies);
+    Q_INVOKABLE void prepareSource(
+        const QString &sourcePath, qint64 sourceDurationMs, int sourceWidth, int sourceHeight);
+    Q_INVOKABLE void startTrial(
+        const QString &sourcePath, qint64 sourceDurationMs,
+        int sourceWidth, int sourceHeight, int maxRallies);
+    Q_INVOKABLE void startFullAnalysis(
+        const QString &sourcePath, qint64 sourceDurationMs,
+        int sourceWidth, int sourceHeight);
     Q_INVOKABLE void cancel();
     Q_INVOKABLE void reset();
     Q_INVOKABLE QUrl clipUrl(int index) const;
-    Q_INVOKABLE bool exportRally(int index, const QUrl &folderUrl);
+    Q_INVOKABLE bool exportRally(int index, const QUrl &folderUrl, const QString &quality);
+    Q_INVOKABLE bool exportAssembly(
+        const QVariantList &rows, const QUrl &folderUrl,
+        const QString &quality, const QString &baseName);
     Q_INVOKABLE void openOutputFolder() const;
 
 signals:
@@ -56,6 +72,9 @@ private:
     enum class Stage { Idle, Proxy, Inference, Complete, Paused, Error };
 
     void configurePaths(const QString &sourcePath);
+    void beginAnalysis(
+        const QString &sourcePath, qint64 sourceDurationMs,
+        int sourceWidth, int sourceHeight, int maxRallies, bool fullAnalysis);
     void startProxy(bool softwareFallback);
     void startInference();
     void readProcessOutput();
@@ -67,10 +86,13 @@ private:
     void loadRallies();
     void fail(const QString &message);
     void appendLog(const QString &text);
+    void readExportOutput();
+    void exportFinished(int exitCode, QProcess::ExitStatus exitStatus);
     static QString discoverProjectRoot();
     static QString formatSeconds(double seconds);
 
     QProcess m_process;
+    QProcess m_exportProcess;
     QTimer m_refreshTimer;
     Stage m_stage = Stage::Idle;
     QString m_state = QStringLiteral("idle");
@@ -91,10 +113,17 @@ private:
     QString m_runnerPath;
     QString m_modelPath;
     QString m_vendorPath;
+    QString m_exportTemporaryPath;
+    QString m_exportFinalPath;
     qint64 m_sourceDurationMs = 0;
+    qint64 m_exportDurationMs = 0;
+    int m_sourceWidth = 0;
+    int m_sourceHeight = 0;
     int m_maxRallies = 5;
     double m_progress = 0.0;
+    double m_exportProgress = 0.0;
     bool m_proxySoftwareFallback = false;
     bool m_cancelRequested = false;
+    bool m_fullAnalysis = false;
     QVariantList m_rallies;
 };

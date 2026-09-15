@@ -15,10 +15,9 @@ Rectangle {
     ListModel {
         id: steps
         ListElement { stepTitle: "视频导入"; stepCaption: "选择并检查源素材" }
-        ListElement { stepTitle: "切分试验"; stepCaption: "前几回合预览与导出" }
-        ListElement { stepTitle: "回合显示"; stepCaption: "查看识别的全部回合" }
-        ListElement { stepTitle: "拍数显示"; stepCaption: "自动结果与人工标定" }
-        ListElement { stepTitle: "回合微调"; stepCaption: "修正时间边界与顺序" }
+        ListElement { stepTitle: "回合分析"; stepCaption: "增量识别并查看回合" }
+        ListElement { stepTitle: "回合拼接"; stepCaption: "选择、排序与调整时间" }
+        ListElement { stepTitle: "视频导出"; stepCaption: "预览并输出最终视频" }
     }
 
     ColumnLayout {
@@ -119,7 +118,7 @@ Rectangle {
                 spacing: 5
 
                 Text {
-                    text: qsTr("UI 骨架演示")
+                    text: qsTr("TrackNet 分析流程")
                     color: Theme.text
                     font.pixelSize: 11
                     font.weight: Font.DemiBold
@@ -127,7 +126,7 @@ Rectangle {
 
                 Text {
                     width: parent.width
-                    text: qsTr("当前数据和操作均为占位内容")
+                    text: qsTr("回合结果可随时停止并继续")
                     color: Theme.textDim
                     font.pixelSize: 10
                     wrapMode: Text.WordWrap

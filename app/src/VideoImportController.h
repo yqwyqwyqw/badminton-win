@@ -11,6 +11,8 @@ class VideoImportController final : public QObject
     Q_PROPERTY(bool ready READ ready NOTIFY changed)
     Q_PROPERTY(bool loading READ loading NOTIFY changed)
     Q_PROPERTY(qint64 durationMs READ durationMs NOTIFY changed)
+    Q_PROPERTY(int sourceWidth READ sourceWidth NOTIFY changed)
+    Q_PROPERTY(int sourceHeight READ sourceHeight NOTIFY changed)
     Q_PROPERTY(QString filePath READ filePath NOTIFY changed)
     Q_PROPERTY(QUrl sourceUrl READ sourceUrl NOTIFY changed)
     Q_PROPERTY(QString fileName READ fileName NOTIFY changed)
@@ -31,6 +33,8 @@ public:
     bool ready() const { return m_ready; }
     bool loading() const { return m_loading; }
     qint64 durationMs() const { return m_durationMs; }
+    int sourceWidth() const { return m_sourceWidth; }
+    int sourceHeight() const { return m_sourceHeight; }
     QString filePath() const { return m_filePath; }
     QUrl sourceUrl() const { return m_filePath.isEmpty() ? QUrl() : QUrl::fromLocalFile(m_filePath); }
     QString fileName() const { return m_fileName; }
@@ -60,6 +64,8 @@ private:
     bool m_ready = false;
     bool m_loading = false;
     qint64 m_durationMs = 0;
+    int m_sourceWidth = 0;
+    int m_sourceHeight = 0;
     QString m_filePath;
     QString m_fileName;
     QString m_fileSizeText = QStringLiteral("—");

@@ -59,16 +59,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def replace_with_retry(temporary: Path, destination: Path) -> None:
+    """Replace a UI-polled file, tolerating short-lived Windows read locks."""
+    deadline = time.monotonic() + 5.0
+    delay = 0.025
+    while True:
+        try:
+            os.replace(temporary, destination)
+            return
+        except OSError as error:
+            # On Windows the Qt UI can briefly hold the destination while its
+            # refresh timer reads it. Access denied/sharing violation is
+            # transient; other errors still need to fail immediately.
+            if getattr(error, "winerror", None) not in (5, 32):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.6, 0.25)
+
+
 def atomic_json(path: Path, value: dict | list) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    replace_with_retry(temporary, path)
 
 
 def atomic_csv(path: Path, data: pd.DataFrame) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     data.to_csv(temporary, index=False)
-    os.replace(temporary, path)
+    replace_with_retry(temporary, path)
 
 
 def inspect_video(path: Path) -> dict:

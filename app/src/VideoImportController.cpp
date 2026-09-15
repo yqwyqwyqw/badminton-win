@@ -90,6 +90,8 @@ void VideoImportController::importVideo(const QUrl &url)
     m_ready = false;
     m_loading = true;
     m_durationMs = 0;
+    m_sourceWidth = 0;
+    m_sourceHeight = 0;
     m_filePath = QDir::toNativeSeparators(info.absoluteFilePath());
     m_fileName = info.fileName();
     m_fileSizeText = formatBytes(info.size());
@@ -128,6 +130,8 @@ void VideoImportController::clear()
     m_ready = false;
     m_loading = false;
     m_durationMs = 0;
+    m_sourceWidth = 0;
+    m_sourceHeight = 0;
     m_filePath.clear();
     m_fileName.clear();
     m_fileSizeText = QStringLiteral("—");
@@ -147,8 +151,11 @@ void VideoImportController::refreshMetadata()
 {
     const QMediaMetaData metadata = m_player.metaData();
     const QSize resolution = metadata.value(QMediaMetaData::Resolution).toSize();
-    if (resolution.isValid())
+    if (resolution.isValid()) {
+        m_sourceWidth = resolution.width();
+        m_sourceHeight = resolution.height();
         m_resolutionText = QStringLiteral("%1 × %2").arg(resolution.width()).arg(resolution.height());
+    }
 
     const double frameRate = metadata.value(QMediaMetaData::VideoFrameRate).toDouble();
     if (frameRate > 0)

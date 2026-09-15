@@ -17,17 +17,15 @@ ApplicationWindow {
 
     property int currentStep: 0
     property int selectedRally: 0
-    property int selectedTrialRally: 0
-    property bool analysisPaused: false
 
-    ListModel {
-        id: rallyModel
-
-        ListElement { rallyNumber: 1; timeRange: "00:03 - 00:07"; autoHits: 3; effectiveHits: 3; reviewState: "已识别" }
-        ListElement { rallyNumber: 2; timeRange: "00:10 - 00:15"; autoHits: 5; effectiveHits: 4; reviewState: "已人工修正" }
-        ListElement { rallyNumber: 3; timeRange: "00:26 - 00:30"; autoHits: 4; effectiveHits: 2; reviewState: "已人工修正" }
-        ListElement { rallyNumber: 4; timeRange: "00:36 - 00:41"; autoHits: 6; effectiveHits: 4; reviewState: "待复核" }
-        ListElement { rallyNumber: 5; timeRange: "00:45 - 00:53"; autoHits: 6; effectiveHits: 6; reviewState: "已识别" }
+    onCurrentStepChanged: {
+        if (currentStep >= 1 && videoImporter.ready) {
+            trialAnalyzer.prepareSource(
+                videoImporter.filePath,
+                videoImporter.durationMs,
+                videoImporter.sourceWidth,
+                videoImporter.sourceHeight)
+        }
     }
 
     header: AppHeader {
@@ -36,14 +34,14 @@ ApplicationWindow {
                      : qsTr("尚未导入素材")
         statusText: window.currentStep === 0
                     ? videoImporter.statusText
-                    : (window.currentStep === 1
+                    : (window.currentStep === 1 || window.currentStep === 2
                        ? trialAnalyzer.stageText
-                       : (analysisPaused ? qsTr("分析已暂停") : qsTr("正在分析 · 38%")))
+                       : qsTr("等待拼接结果导出"))
         statusActive: window.currentStep === 0
                       ? videoImporter.ready
-                      : (window.currentStep === 1
+                      : (window.currentStep === 1 || window.currentStep === 2
                          ? trialAnalyzer.state !== "error"
-                         : !analysisPaused)
+                         : trialAnalyzer.hasResults)
         onNewProjectRequested: {
             trialAnalyzer.reset()
             videoImporter.clear()
@@ -75,56 +73,39 @@ ApplicationWindow {
                 onContinueRequested: window.currentStep = 1
             }
 
-            CutTrialPanel {
+            RallyLibraryPanel {
                 anchors.fill: parent
                 anchors.margins: 20
                 visible: window.currentStep === 1
                 importer: videoImporter
                 analyzer: trialAnalyzer
-                selectedRally: window.selectedTrialRally
+                selectedRally: window.selectedRally
+                onPreviousRequested: window.selectedRally = Math.max(0, window.selectedRally - 1)
+                onNextRequested: window.selectedRally = Math.min(
+                                     trialAnalyzer.rallyCount - 1,
+                                     window.selectedRally + 1)
             }
 
-            ColumnLayout {
+            RallyAssemblyPanel {
+                id: assemblyPanel
                 anchors.fill: parent
                 anchors.margins: 20
-                spacing: 14
-                visible: window.currentStep >= 2
-
-                AnalysisStatusCard {
-                    Layout.fillWidth: true
-                    progress: 0.38
-                    processedText: qsTr("已解析 02:18 / 06:04")
-                    rallyCount: rallyModel.count
-                    paused: window.analysisPaused
-                    onPauseToggled: window.analysisPaused = !window.analysisPaused
-                }
-
-                VideoPreview {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    rallyNumber: rallyModel.get(window.selectedRally).rallyNumber
-                    timeRange: rallyModel.get(window.selectedRally).timeRange
-                }
-
-                TimelinePlaceholder {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 104
-                    selectedRally: window.selectedRally
-                    rallyCount: rallyModel.count
+                visible: window.currentStep === 2
+                importer: videoImporter
+                analyzer: trialAnalyzer
+                onExportPushed: {
+                    window.currentStep = 3
                 }
             }
-        }
 
-        RallyListPanel {
-            Layout.preferredWidth: 340
-            Layout.fillHeight: true
-            visible: window.currentStep >= 2
-            model: rallyModel
-            selectedIndex: window.selectedRally
-            onRallySelected: function(index) { window.selectedRally = index }
-            onHitCountChanged: function(index, count) {
-                rallyModel.setProperty(index, "effectiveHits", count)
-                rallyModel.setProperty(index, "reviewState", "已人工修正")
+            VideoExportPanel {
+                anchors.fill: parent
+                anchors.margins: 20
+                visible: window.currentStep === 3
+                importer: videoImporter
+                analyzer: trialAnalyzer
+                assembly: assemblyPanel
+                onReturnRequested: window.currentStep = 2
             }
         }
 
@@ -133,8 +114,10 @@ ApplicationWindow {
             Layout.fillHeight: true
             visible: window.currentStep === 1
             analyzer: trialAnalyzer
-            selectedIndex: window.selectedTrialRally
-            onRallySelected: function(index) { window.selectedTrialRally = index }
+            importer: videoImporter
+            fullMode: true
+            selectedIndex: window.selectedRally
+            onRallySelected: function(index) { window.selectedRally = index }
         }
     }
 }
