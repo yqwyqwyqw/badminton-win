@@ -64,7 +64,7 @@ if (-not $SkipSourceArchive) {
     }
 }
 
-Write-Host "Windows 包：$zipPath"
+Write-Host "Windows package: $zipPath"
 if ($sourceZip) {
-    Write-Host "源代码包：$sourceZip"
+    Write-Host "Source package: $sourceZip"
 }
