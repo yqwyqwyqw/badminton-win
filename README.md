@@ -17,9 +17,18 @@
 ## 技术栈
 
 - Windows 桌面界面：Qt 6、QML、C++20、CMake
-- 羽毛球轨迹验证：TrackNet、Python、PyTorch
-- 视频代理与切片：FFmpeg
+- 羽毛球轨迹推理：TrackNetV3，**进程内 ONNX Runtime + DirectML**（无需 Python / PyTorch）
+- 视频代理、切片与拼接：FFmpeg（以独立子进程调用，避免 GPL 传染）
 - 处理原则：全部本地运行，不依赖服务器；轨迹是回合判断的主要依据
+
+## 运行要求与分发形态
+
+- Windows 10 / 11 64 位，需要支持 **DirectX 12** 的显卡（推理走 DirectML）
+- 免安装运行，缓存写在 `%LOCALAPPDATA%\BadmintonAnalyzer\<应用名>\cache\<视频名-hash>`，按视频隔离；
+  界面上的「新建项目」会自动清理上一个项目的缓存
+- 发布形态为 **安装包** `badminton-analyzer-v*-setup.exe`（按用户安装、免管理员、带快捷方式与卸载项）；
+  需要绿色形态时可用 `scripts/release-windows.ps1` / `scripts/make-portable-exe.ps1` 自行生成
+- 第三方组件与许可见 `THIRD-PARTY-NOTICES.md`（FFmpeg 为 GPLv3，未链接 libav\*）
 
 ## 实现方式
 

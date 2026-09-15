@@ -25,6 +25,9 @@ Item {
     onSelectedClipChanged: {
         rallyPlayer.stop()
         rallyPlayer.source = selectedClip
+        // 切到某一段就立即播放，并一直循环这一段（不再自动跳下一段）
+        if (selectedClip.toString().length > 0)
+            rallyPlayer.play()
     }
 
     AudioOutput {
@@ -38,6 +41,7 @@ Item {
         source: root.selectedClip
         audioOutput: rallyAudio
         videoOutput: rallyVideo
+        loops: MediaPlayer.Infinite  // 单回合循环播放
     }
 
     ColumnLayout {
@@ -267,8 +271,10 @@ Item {
                     spacing: 9
 
                     Button {
-                        Layout.preferredWidth: 60
+                        Layout.preferredWidth: 82
                         Layout.preferredHeight: 30
+                        leftPadding: 6
+                        rightPadding: 6
                         enabled: root.selectedRally > 0
                         text: qsTr("上一回合")
                         onClicked: root.previousRequested()
@@ -303,8 +309,10 @@ Item {
                         onClicked: root.muted = !root.muted
                     }
                     Button {
-                        Layout.preferredWidth: 60
+                        Layout.preferredWidth: 82
                         Layout.preferredHeight: 30
+                        leftPadding: 6
+                        rightPadding: 6
                         enabled: root.selectedRally + 1 < root.analyzer.rallyCount
                         text: qsTr("下一回合")
                         onClicked: root.nextRequested()

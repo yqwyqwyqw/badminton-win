@@ -1,9 +1,12 @@
 #include "TrialAnalysisController.h"
 
+#include "inference/inference_job.h"
+
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -42,6 +45,30 @@ TrialAnalysisController::TrialAnalysisController(QObject *parent)
 
     m_refreshTimer.setInterval(500);
     connect(&m_refreshTimer, &QTimer::timeout, this, &TrialAnalysisController::refreshFiles);
+    m_cleanupTimer.setSingleShot(true);
+    m_cleanupTimer.setInterval(300);
+    connect(&m_cleanupTimer, &QTimer::timeout, this, &TrialAnalysisController::runPendingCleanup);
+}
+
+// Runs on the in-process ONNX Runtime kernel now, so "running" covers both the
+// ffmpeg proxy step and the inference job.
+bool TrialAnalysisController::running() const
+{
+    return (m_job != nullptr && m_job->isRunning()) || m_process.state() != QProcess::NotRunning;
+}
+
+// Packaged layout first (<exe>/resources/...), then the source tree (dev builds).
+QString TrialAnalysisController::resolveResource(
+    const QString &packagedRelative, const QString &developmentRelative) const
+{
+    const QString packaged = QDir(QCoreApplication::applicationDirPath())
+                                 .filePath(QStringLiteral("resources/") + packagedRelative);
+    if (QFileInfo::exists(packaged))
+        return packaged;
+    const QString development = QDir(m_projectRoot).filePath(developmentRelative);
+    if (QFileInfo::exists(development))
+        return development;
+    return packaged;  // missing: report the packaged path the app expects
 }
 
 bool TrialAnalysisController::proxyReady() const
@@ -73,6 +100,7 @@ void TrialAnalysisController::prepareSource(
         m_rallies.clear();
         m_etaText.clear();
         m_progress = 0.0;
+        m_actionMessage.clear();
         emit changed();
     }
     m_maxRallies = 0;
@@ -127,9 +155,7 @@ void TrialAnalysisController::beginAnalysis(
         emit changed();
     }
 
-    const QStringList required = {
-        m_ffmpegPath, m_pythonPath, m_runnerPath, m_modelPath, m_vendorPath
-    };
+    const QStringList required = { m_ffmpegPath, m_modelPath };
     for (const QString &path : required) {
         if (!QFileInfo::exists(path)) {
             fail(QStringLiteral("缺少运行依赖：%1").arg(QDir::toNativeSeparators(path)));
@@ -164,11 +190,36 @@ void TrialAnalysisController::cancel()
     m_cancelRequested = true;
     m_stageText = QStringLiteral("正在停止，已完成分块会保留");
     emit changed();
-    m_process.terminate();
-    QTimer::singleShot(2500, this, [this]() {
-        if (m_process.state() != QProcess::NotRunning)
-            m_process.kill();
-    });
+    if (m_job != nullptr)
+        m_job->cancel();
+    if (m_process.state() != QProcess::NotRunning) {
+        m_process.terminate();
+        QTimer::singleShot(2500, this, [this]() {
+            if (m_process.state() != QProcess::NotRunning)
+                m_process.kill();
+        });
+    }
+}
+
+// 目录总字节数（用于告诉用户清理掉了多少缓存）
+static qint64 DirectorySize(const QString &path)
+{
+    qint64 total = 0;
+    QDirIterator iterator(path, QDir::Files | QDir::Hidden | QDir::NoSymLinks,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        iterator.next();
+        total += iterator.fileInfo().size();
+    }
+    return total;
+}
+
+QString TrialAnalysisController::formatSize(qint64 bytes)
+{
+    const double value = static_cast<double>(bytes);
+    if (value >= 1024.0 * 1024.0 * 1024.0)
+        return QStringLiteral("%1 GB").arg(value / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
+    return QStringLiteral("%1 MB").arg(value / (1024.0 * 1024.0), 0, 'f', 1);
 }
 
 void TrialAnalysisController::reset()
@@ -176,9 +227,17 @@ void TrialAnalysisController::reset()
     if (running())
         cancel();
     m_refreshTimer.stop();
+
+    // 新建项目：顺手清掉上一个项目分析产生的缓存（720p 代理、分块轨迹、回合短片、报告）。
+    // 取消是异步的，分析线程可能还在写盘，所以这里只排队，等它停下再删。
+    if (!m_outputDirectory.isEmpty()) {
+        m_pendingCleanupPath = m_outputDirectory;
+        m_cleanupTimer.start();
+    }
+
     m_stage = Stage::Idle;
     m_state = QStringLiteral("idle");
-    m_stageText = QStringLiteral("等待开始切分试验");
+    m_stageText = QStringLiteral("等待开始回合分析");
     m_detailText = QStringLiteral("将只分析指定数量的前几个回合");
     m_etaText.clear();
     m_errorMessage.clear();
@@ -186,7 +245,44 @@ void TrialAnalysisController::reset()
     m_progress = 0.0;
     m_fullAnalysis = false;
     m_rallies.clear();
+    m_sourcePath.clear();
+    m_outputDirectory.clear();
+    m_proxyPath.clear();
+    m_proxyTemporaryPath.clear();
+    m_analysisDirectory.clear();
     emit changed();
+}
+
+void TrialAnalysisController::runPendingCleanup()
+{
+    if (m_pendingCleanupPath.isEmpty())
+        return;
+    // 代理进程或分析线程还在收尾：稍后重试（最多等约 30 秒，避免定时器空转）
+    if ((m_job != nullptr && m_job->isRunning()) || m_process.state() != QProcess::NotRunning) {
+        if (++m_cleanupRetries > 100) {
+            m_cleanupRetries = 0;
+            m_pendingCleanupPath.clear();
+            return;
+        }
+        m_cleanupTimer.start();
+        return;
+    }
+    m_cleanupRetries = 0;
+
+    const QString path = m_pendingCleanupPath;
+    m_pendingCleanupPath.clear();
+    // 同一部视频又被导入了（缓存目录相同）就不要删
+    if (!m_outputDirectory.isEmpty() && QDir::cleanPath(path) == QDir::cleanPath(m_outputDirectory))
+        return;
+
+    QDir directory(path);
+    if (!directory.exists())
+        return;
+    const qint64 freed = DirectorySize(path);
+    if (directory.removeRecursively()) {
+        m_actionMessage = QStringLiteral("已清理上次分析的缓存（%1）").arg(formatSize(freed));
+        emit changed();
+    }
 }
 
 QUrl TrialAnalysisController::clipUrl(int index) const
@@ -464,21 +560,20 @@ void TrialAnalysisController::configurePaths(const QString &sourcePath)
     const QString key = QString::fromLatin1(
         QCryptographicHash::hash(identity, QCryptographicHash::Sha1).toHex().left(10));
 
-    m_outputDirectory = QDir(m_projectRoot).filePath(
-        QStringLiteral("validation-output/ui-trials/%1-%2").arg(safeName, key));
+    // Cache lives outside the source tree (previously <project>/validation-output/
+    // ui-trials, which does not exist for an installed copy of the app).
+    const QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    m_outputDirectory = QDir(cacheRoot.isEmpty() ? QDir::tempPath() : cacheRoot)
+                            .filePath(QStringLiteral("cache/%1-%2").arg(safeName, key));
     m_proxyPath = QDir(m_outputDirectory).filePath(QStringLiteral("proxy-720p.mp4"));
     m_proxyTemporaryPath = QDir(m_outputDirectory).filePath(QStringLiteral("proxy-720p.part.mp4"));
     m_analysisDirectory = QDir(m_outputDirectory).filePath(QStringLiteral("tracknet"));
-    m_ffmpegPath = QDir(m_projectRoot).filePath(
+    m_ffmpegPath = resolveResource(
+        QStringLiteral("ffmpeg/ffmpeg.exe"),
         QStringLiteral(".tools/ffmpeg/ffmpeg-9.0.1-full_build-shared/bin/ffmpeg.exe"));
-    m_pythonPath = QDir(m_projectRoot).filePath(
-        QStringLiteral(".venv-validation/Scripts/python.exe"));
-    m_runnerPath = QDir(m_projectRoot).filePath(
-        QStringLiteral("validation/run_chunked_tracknet.py"));
-    m_modelPath = QDir(m_projectRoot).filePath(
-        QStringLiteral(".tools/models/TrackNetV3/ckpts/TrackNet_best.pt"));
-    m_vendorPath = QDir(m_projectRoot).filePath(
-        QStringLiteral(".tools/vendor/BadmintonTrackNet"));
+    m_modelPath = resolveResource(
+        QStringLiteral("models/tracknet-8f-concat-288x512-sizes-fp16.onnx"),
+        QStringLiteral("validation-output/golden/models/tracknet-8f-concat-288x512-sizes-fp16.onnx"));
 }
 
 void TrialAnalysisController::startProxy(bool softwareFallback)
@@ -536,33 +631,61 @@ void TrialAnalysisController::startInference()
         : QStringLiteral("TrackNet 正在识别前 %1 个回合").arg(m_maxRallies);
     m_detailText = QStringLiteral("每识别完一个完整回合，就会立即出现在右侧");
 
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
-    const QString existingPythonPath = environment.value(QStringLiteral("PYTHONPATH"));
-    environment.insert(
-        QStringLiteral("PYTHONPATH"),
-        existingPythonPath.isEmpty()
-            ? m_vendorPath
-            : m_vendorPath + QDir::listSeparator() + existingPythonPath);
+    if (m_job == nullptr) {
+        m_job = new InferenceJob(this);
+        connect(m_job, &InferenceJob::progressed,
+                this, &TrialAnalysisController::inferenceProgressed);
+        connect(m_job, &InferenceJob::finished,
+                this, &TrialAnalysisController::inferenceFinished);
+    }
 
-    QStringList arguments = {
-        m_runnerPath,
-        QStringLiteral("--video"), m_proxyPath,
-        QStringLiteral("--tracknet-file"), m_modelPath,
-        QStringLiteral("--output-dir"), m_analysisDirectory,
-        QStringLiteral("--chunk-seconds"), QStringLiteral("6"),
-        QStringLiteral("--overlap-seconds"), QStringLiteral("0.5"),
-        QStringLiteral("--batch-size"), QStringLiteral("8"),
-        QStringLiteral("--eval-mode"), QStringLiteral("nonoverlap"),
-        QStringLiteral("--ffmpeg"), m_ffmpegPath
-    };
-    if (m_maxRallies > 0)
-        arguments << QStringLiteral("--max-rallies") << QString::number(m_maxRallies);
+    InferenceJob::Request request;
+    request.ffmpegPath = m_ffmpegPath;
+    request.modelPath = m_modelPath;
+    request.videoPath = m_proxyPath;
+    request.outputDir = m_analysisDirectory;
+    request.sourcePath = m_sourcePath;
+    request.maxRallies = m_maxRallies;
+    request.useDirectML = true;
+    m_job->start(request);
+    emit changed();
+}
 
-    m_process.setWorkingDirectory(m_projectRoot);
-    m_process.setProcessEnvironment(environment);
-    m_process.setProgram(m_pythonPath);
-    m_process.setArguments(arguments);
-    m_process.start();
+void TrialAnalysisController::inferenceProgressed()
+{
+    refreshFiles();
+    emit changed();
+}
+
+void TrialAnalysisController::inferenceFinished(bool ok, const QString &message)
+{
+    if (m_cancelRequested) {
+        m_cancelRequested = false;
+        m_stage = Stage::Paused;
+        m_state = QStringLiteral("paused");
+        m_stageText = QStringLiteral("试验已停止，可继续运行");
+        m_detailText = QStringLiteral("已完成的代理、轨迹分块和回合短片均已保留");
+        m_etaText.clear();
+        m_refreshTimer.stop();
+        refreshFiles();
+        emit changed();
+        return;
+    }
+
+    refreshFiles();
+    if (!ok) {
+        fail(QStringLiteral("TrackNet 试验失败：%1").arg(message));
+        return;
+    }
+    m_stage = Stage::Complete;
+    m_state = QStringLiteral("complete");
+    m_progress = 1.0;
+    m_etaText.clear();
+    m_stageText = QStringLiteral("回合分析完成");
+    m_detailText = m_fullAnalysis
+        ? QStringLiteral("完整视频分析完成，共识别 %1 个回合").arg(m_rallies.size())
+        : QStringLiteral("已生成 %1 个可预览回合").arg(m_rallies.size());
+    m_refreshTimer.stop();
     emit changed();
 }
 
@@ -676,23 +799,7 @@ void TrialAnalysisController::processFinished(int exitCode, QProcess::ExitStatus
         return;
     }
 
-    if (m_stage == Stage::Inference) {
-        refreshFiles();
-        if (!succeeded) {
-            fail(QStringLiteral("TrackNet 试验失败：%1").arg(m_logTail.right(700)));
-            return;
-        }
-        m_stage = Stage::Complete;
-        m_state = QStringLiteral("complete");
-        m_progress = 1.0;
-        m_etaText.clear();
-        m_stageText = QStringLiteral("切分试验完成");
-        m_detailText = m_fullAnalysis
-            ? QStringLiteral("完整视频分析完成，共识别 %1 个回合").arg(m_rallies.size())
-            : QStringLiteral("已生成 %1 个可预览回合").arg(m_rallies.size());
-        m_refreshTimer.stop();
-        emit changed();
-    }
+    // The inference stage is driven by InferenceJob::finished, not by a process.
 }
 
 void TrialAnalysisController::refreshFiles()
@@ -729,7 +836,7 @@ void TrialAnalysisController::loadProgress()
         } else if (status == QStringLiteral("sample_complete")) {
             m_stage = Stage::Complete;
             m_state = QStringLiteral("complete");
-            m_stageText = QStringLiteral("已恢复切分试验结果");
+            m_stageText = QStringLiteral("已恢复回合分析结果");
             m_detailText = QStringLiteral("可继续分析完整视频");
         }
     }
@@ -777,7 +884,7 @@ void TrialAnalysisController::fail(const QString &message)
     m_state = QStringLiteral("error");
     m_stageText = m_fullAnalysis
         ? QStringLiteral("完整分析未完成")
-        : QStringLiteral("切分试验未完成");
+        : QStringLiteral("回合分析未完成");
     m_errorMessage = message;
     m_refreshTimer.stop();
     emit changed();
@@ -796,7 +903,7 @@ QString TrialAnalysisController::discoverProjectRoot()
     for (const QString &start : starts) {
         QDir directory(start);
         for (int depth = 0; depth < 7; ++depth) {
-            if (directory.exists(QStringLiteral("validation/run_chunked_tracknet.py"))
+            if (directory.exists(QStringLiteral("app/CMakeLists.txt"))
                 && directory.exists(QStringLiteral(".tools")))
                 return directory.absolutePath();
             if (!directory.cdUp())

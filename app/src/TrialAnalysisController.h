@@ -6,6 +6,8 @@
 #include <QUrl>
 #include <QVariantList>
 
+class InferenceJob;
+
 class TrialAnalysisController final : public QObject
 {
     Q_OBJECT
@@ -30,7 +32,7 @@ class TrialAnalysisController final : public QObject
 public:
     explicit TrialAnalysisController(QObject *parent = nullptr);
 
-    bool running() const { return m_process.state() != QProcess::NotRunning; }
+    bool running() const;
     bool hasResults() const { return !m_rallies.isEmpty(); }
     bool proxyReady() const;
     bool fullAnalysis() const { return m_fullAnalysis; }
@@ -77,6 +79,8 @@ private:
         int sourceWidth, int sourceHeight, int maxRallies, bool fullAnalysis);
     void startProxy(bool softwareFallback);
     void startInference();
+    void inferenceProgressed();
+    void inferenceFinished(bool ok, const QString &message);
     void readProcessOutput();
     void readProcessError();
     void processLine(const QString &line);
@@ -88,15 +92,24 @@ private:
     void appendLog(const QString &text);
     void readExportOutput();
     void exportFinished(int exitCode, QProcess::ExitStatus exitStatus);
+    // 新建项目后清理上一个项目的分析缓存（等分析线程收尾，避免边写边删）
+    void runPendingCleanup();
     static QString discoverProjectRoot();
     static QString formatSeconds(double seconds);
+    static QString formatSize(qint64 bytes);
+    // Packaged layout first (<exe>/resources/...), then the source tree (dev).
+    QString resolveResource(const QString &packagedRelative, const QString &developmentRelative) const;
 
     QProcess m_process;
     QProcess m_exportProcess;
+    InferenceJob *m_job = nullptr;
     QTimer m_refreshTimer;
+    QTimer m_cleanupTimer;
+    QString m_pendingCleanupPath;
+    int m_cleanupRetries = 0;
     Stage m_stage = Stage::Idle;
     QString m_state = QStringLiteral("idle");
-    QString m_stageText = QStringLiteral("等待开始切分试验");
+    QString m_stageText = QStringLiteral("等待开始回合分析");
     QString m_detailText = QStringLiteral("将只分析指定数量的前几个回合");
     QString m_etaText;
     QString m_errorMessage;
@@ -109,10 +122,7 @@ private:
     QString m_proxyTemporaryPath;
     QString m_analysisDirectory;
     QString m_ffmpegPath;
-    QString m_pythonPath;
-    QString m_runnerPath;
     QString m_modelPath;
-    QString m_vendorPath;
     QString m_exportTemporaryPath;
     QString m_exportFinalPath;
     qint64 m_sourceDurationMs = 0;

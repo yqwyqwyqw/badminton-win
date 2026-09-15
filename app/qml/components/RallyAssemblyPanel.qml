@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import QtMultimedia
 import BadmintonAnalyzer
@@ -19,6 +20,16 @@ Item {
     property int revision: 0
     property int lastPushedRevision: -1
     property bool hasPushed: false
+    property string exportQuality: "720p"
+    property int exportRallyNumber: 0
+    property var pendingExportRows: []
+    property var qualityOptions: {
+        const options = [ { label: qsTr("720p 快速"), code: "720p" } ]
+        if (importer.sourceHeight > 1080)
+            options.push({ label: qsTr("1080p 高清"), code: "1080p" })
+        options.push({ label: qsTr("原始画质 · %1").arg(importer.resolutionText), code: "source" })
+        return options
+    }
     readonly property bool exportDirty: root.hasPushed && root.revision !== root.lastPushedRevision
     signal assemblyChanged()
     signal exportPushed()
@@ -122,6 +133,30 @@ Item {
         root.exportPushed()
     }
 
+    // 单回合导出：直接用当前（可能已微调）的边界，走拼接导出通道的单行版本
+    function exportActiveRow() {
+        if (root.analyzer.exporting || root.activeIndex < 0
+                || root.activeIndex >= assemblyModel.count)
+            return
+        root.exportRallyNumber = assemblyModel.get(root.activeIndex).rally
+        root.pendingExportRows = root.activeExportRows()
+        singleExportFolder.open()
+    }
+
+    function activeExportRows() {
+        if (root.activeIndex < 0 || root.activeIndex >= assemblyModel.count)
+            return []
+        const row = assemblyModel.get(root.activeIndex)
+        return [ {
+            rally: row.rally,
+            startSeconds: row.startSeconds,
+            endSeconds: row.endSeconds,
+            hitCount: row.hitCount,
+            remark: row.remark || "",
+            selected: true  // 直接导出本回合时不看隐藏状态
+        } ]
+    }
+
     function restoreOriginalOrder() {
         for (let target = 0; target < assemblyModel.count; ++target) {
             let lowest = target
@@ -152,6 +187,7 @@ Item {
         assemblyModel.setProperty(root.activeIndex, "endSeconds", row.originalEndSeconds)
         root.updateTimeFields()
         root.assemblyChanged()
+        root.replayActiveFromStart()
     }
 
     function syncRallies() {
@@ -269,6 +305,13 @@ Item {
         root.updateTimeFields()
     }
 
+    // 微调边界后回到该段起点继续播放（微调完停在原地不好接着看）
+    function replayActiveFromStart() {
+        if (root.activeIndex < 0 || root.activeIndex >= assemblyModel.count)
+            return
+        root.selectRow(root.activeIndex, true)
+    }
+
     function findSelected(start, direction) {
         for (let i = start + direction; i >= 0 && i < assemblyModel.count; i += direction) {
             if (assemblyModel.get(i).selected)
@@ -300,6 +343,7 @@ Item {
         }
         root.updateTimeFields()
         root.assemblyChanged()
+        root.replayActiveFromStart()
     }
 
     function applyBoundary(kind, text) {
@@ -319,6 +363,7 @@ Item {
         }
         root.updateTimeFields()
         root.assemblyChanged()
+        root.replayActiveFromStart()
     }
 
     ListModel {
@@ -507,6 +552,16 @@ Item {
         }
     }
 
+    FolderDialog {
+        id: singleExportFolder
+        title: qsTr("选择本回合导出目录")
+        onAccepted: root.analyzer.exportAssembly(
+                        root.pendingExportRows,
+                        selectedFolder,
+                        root.exportQuality,
+                        "rally-" + String(root.exportRallyNumber).padStart(4, "0"))
+    }
+
     Connections {
         target: assemblyPlayer
         function onMediaStatusChanged() {
@@ -528,11 +583,8 @@ Item {
             const row = assemblyModel.get(root.activeIndex)
             if (position + 60 < Number(row.endSeconds) * 1000)
                 return
-            const next = root.findSelected(root.activeIndex, 1)
-            if (next >= 0)
-                root.selectRow(next, true)
-            else
-                assemblyPlayer.pause()
+            // 整理阶段只循环当前这一段：到段尾就回到段首继续播放，不自动跳下一段
+            assemblyPlayer.position = Math.max(0, Number(row.startSeconds) * 1000)
         }
     }
 
@@ -690,11 +742,12 @@ Item {
                         spacing: 8
 
                         CompactButton {
-                            Layout.preferredWidth: 58
+                            Layout.preferredWidth: 62
                             Layout.preferredHeight: 30
-                            enabled: root.findSelected(root.activeIndex, -1) >= 0
+                            // 只按位置判断可用性：隐藏/筛选状态不影响上一段、下一段
+                            enabled: root.activeIndex > 0
                             text: qsTr("上一段")
-                            onClicked: root.selectRow(root.findSelected(root.activeIndex, -1), false)
+                            onClicked: root.selectRow(root.activeIndex - 1, true)
                         }
                         Slider {
                             id: assemblySlider
@@ -719,11 +772,11 @@ Item {
                             onClicked: root.muted = !root.muted
                         }
                         CompactButton {
-                            Layout.preferredWidth: 58
+                            Layout.preferredWidth: 62
                             Layout.preferredHeight: 30
-                            enabled: root.findSelected(root.activeIndex, 1) >= 0
+                            enabled: root.activeIndex + 1 < assemblyModel.count
                             text: qsTr("下一段")
-                            onClicked: root.selectRow(root.findSelected(root.activeIndex, 1), false)
+                            onClicked: root.selectRow(root.activeIndex + 1, true)
                         }
                     }
                 }
@@ -1013,147 +1066,226 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 112
+            Layout.preferredHeight: 164
             radius: Theme.radiusMedium
             color: Theme.panel
             border.color: Theme.border
 
-            RowLayout {
+            ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 12
-                spacing: 14
+                spacing: 10
 
-                ColumnLayout {
-                    Layout.preferredWidth: 150
-                    spacing: 2
-                    Text {
-                        text: root.activeIndex >= 0
-                              ? qsTr("回合 %1 · %2")
-                                .arg(root.activeRallyNumber)
-                                .arg(root.formatSeconds(root.rowDuration(assemblyModel.get(root.activeIndex))))
-                              : qsTr("未选择回合")
-                        color: Theme.text
-                        font.pixelSize: 12
-                        font.weight: Font.DemiBold
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    spacing: 10
+
+                    ColumnLayout {
+                        Layout.preferredWidth: 128
+                        spacing: 2
+                        Text {
+                            text: root.activeIndex >= 0
+                                  ? qsTr("回合 %1 · %2")
+                                    .arg(root.activeRallyNumber)
+                                    .arg(root.formatSeconds(root.rowDuration(assemblyModel.get(root.activeIndex))))
+                                  : qsTr("未选择回合")
+                            color: Theme.text
+                            font.pixelSize: 12
+                            font.weight: Font.DemiBold
+                        }
+                        Text {
+                            text: root.activeIndex >= 0 && !assemblyModel.get(root.activeIndex).selected
+                                  ? qsTr("该回合已隐藏，不会进入成片")
+                                  : qsTr("微调当前回合的前后边界")
+                            color: root.activeIndex >= 0 && !assemblyModel.get(root.activeIndex).selected
+                                   ? Theme.warning : Theme.textMuted
+                            font.pixelSize: 9
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
                     }
-                    Text {
-                        text: root.activeIndex >= 0 && !assemblyModel.get(root.activeIndex).selected
-                              ? qsTr("该回合已隐藏，不会进入成片")
-                              : qsTr("微调当前回合的前后边界")
-                        color: root.activeIndex >= 0 && !assemblyModel.get(root.activeIndex).selected
-                               ? Theme.warning : Theme.textMuted
-                        font.pixelSize: 9
-                        wrapMode: Text.WordWrap
-                        Layout.fillWidth: true
+
+                    Rectangle {
+                        Layout.preferredWidth: 1
+                        Layout.fillHeight: true
+                        Layout.topMargin: 8
+                        Layout.bottomMargin: 8
+                        color: Theme.border
+                    }
+
+                    ColumnLayout {
+                        spacing: 4
+                        Text { text: qsTr("开始时间（秒）"); color: Theme.textMuted; font.pixelSize: 9 }
+                        RowLayout {
+                            spacing: 5
+                            TextField {
+                                id: startField
+                                Layout.preferredWidth: 66
+                                Layout.preferredHeight: 32
+                                enabled: root.activeIndex >= 0
+                                selectByMouse: true
+                                color: Theme.text
+                                horizontalAlignment: Text.AlignHCenter
+                                font.pixelSize: 10
+                                validator: DoubleValidator { bottom: 0; decimals: 2 }
+                                onEditingFinished: root.applyBoundary("start", text)
+                                background: Rectangle {
+                                    radius: Theme.radiusSmall
+                                    color: Theme.navigation
+                                    border.color: startField.activeFocus ? Theme.accent : Theme.border
+                                }
+                            }
+                            CompactButton {
+                                Layout.preferredWidth: 44
+                                text: "−0.5"
+                                enabled: root.activeIndex >= 0
+                                onClicked: root.nudgeBoundary("start", -0.5)
+                            }
+                            CompactButton {
+                                Layout.preferredWidth: 44
+                                text: "+0.5"
+                                enabled: root.activeIndex >= 0
+                                onClicked: root.nudgeBoundary("start", 0.5)
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        spacing: 4
+                        Text { text: qsTr("结束时间（秒）"); color: Theme.textMuted; font.pixelSize: 9 }
+                        RowLayout {
+                            spacing: 5
+                            TextField {
+                                id: endField
+                                Layout.preferredWidth: 66
+                                Layout.preferredHeight: 32
+                                enabled: root.activeIndex >= 0
+                                selectByMouse: true
+                                color: Theme.text
+                                horizontalAlignment: Text.AlignHCenter
+                                font.pixelSize: 10
+                                validator: DoubleValidator { bottom: 0; decimals: 2 }
+                                onEditingFinished: root.applyBoundary("end", text)
+                                background: Rectangle {
+                                    radius: Theme.radiusSmall
+                                    color: Theme.navigation
+                                    border.color: endField.activeFocus ? Theme.accent : Theme.border
+                                }
+                            }
+                            CompactButton {
+                                Layout.preferredWidth: 44
+                                text: "−0.5"
+                                enabled: root.activeIndex >= 0
+                                onClicked: root.nudgeBoundary("end", -0.5)
+                            }
+                            CompactButton {
+                                Layout.preferredWidth: 44
+                                text: "+0.5"
+                                enabled: root.activeIndex >= 0
+                                onClicked: root.nudgeBoundary("end", 0.5)
+                            }
+                        }
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    ColumnLayout {
+                        Layout.preferredWidth: 132
+                        spacing: 4
+                        Text {
+                            text: root.activeIndex >= 0
+                                  ? qsTr("原始边界  %1–%2")
+                                    .arg(root.formatSeconds(assemblyModel.get(root.activeIndex).originalStartSeconds))
+                                    .arg(root.formatSeconds(assemblyModel.get(root.activeIndex).originalEndSeconds))
+                                  : qsTr("原始边界  —")
+                            color: Theme.textMuted
+                            font.pixelSize: 9
+                        }
+                        CompactButton {
+                            Layout.fillWidth: true
+                            text: qsTr("恢复原始边界")
+                            enabled: root.activeIndex >= 0
+                            onClicked: root.restoreActiveBoundary()
+                        }
+                        Text {
+                            text: qsTr("三击右侧回合卡片编辑备注")
+                            color: Theme.textDim
+                            font.pixelSize: 8
+                        }
                     }
                 }
 
                 Rectangle {
-                    Layout.preferredWidth: 1
-                    Layout.fillHeight: true
-                    Layout.topMargin: 8
-                    Layout.bottomMargin: 8
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 1
                     color: Theme.border
                 }
 
-                ColumnLayout {
-                    spacing: 4
-                    Text { text: qsTr("开始时间（秒）"); color: Theme.textMuted; font.pixelSize: 9 }
-                    RowLayout {
-                        spacing: 5
-                        TextField {
-                            id: startField
-                            Layout.preferredWidth: 72
-                            Layout.preferredHeight: 32
-                            enabled: root.activeIndex >= 0
-                            selectByMouse: true
-                            color: Theme.text
-                            horizontalAlignment: Text.AlignHCenter
-                            font.pixelSize: 10
-                            validator: DoubleValidator { bottom: 0; decimals: 2 }
-                            onEditingFinished: root.applyBoundary("start", text)
-                            background: Rectangle {
-                                radius: Theme.radiusSmall
-                                color: Theme.navigation
-                                border.color: startField.activeFocus ? Theme.accent : Theme.border
-                            }
-                        }
-                        CompactButton {
-                            Layout.preferredWidth: 48
-                            text: "−0.5"
-                            enabled: root.activeIndex >= 0
-                            onClicked: root.nudgeBoundary("start", -0.5)
-                        }
-                        CompactButton {
-                            Layout.preferredWidth: 48
-                            text: "+0.5"
-                            enabled: root.activeIndex >= 0
-                            onClicked: root.nudgeBoundary("start", 0.5)
-                        }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    // 当前回合的显示/隐藏：读写同一个 model 字段，与右侧列表同步
+                    CompactButton {
+                        Layout.preferredWidth: 112
+                        Layout.preferredHeight: 30
+                        enabled: root.activeIndex >= 0
+                        accentStyle: root.activeIndex >= 0
+                                     && !assemblyModel.get(root.activeIndex).selected
+                        text: root.activeIndex >= 0 && assemblyModel.get(root.activeIndex).selected
+                              ? qsTr("隐藏本回合") : qsTr("显示本回合")
+                        onClicked: root.setRowSelected(
+                                       root.activeIndex,
+                                       !assemblyModel.get(root.activeIndex).selected)
                     }
-                }
 
-                ColumnLayout {
-                    spacing: 4
-                    Text { text: qsTr("结束时间（秒）"); color: Theme.textMuted; font.pixelSize: 9 }
-                    RowLayout {
-                        spacing: 5
-                        TextField {
-                            id: endField
-                            Layout.preferredWidth: 72
-                            Layout.preferredHeight: 32
-                            enabled: root.activeIndex >= 0
-                            selectByMouse: true
-                            color: Theme.text
-                            horizontalAlignment: Text.AlignHCenter
-                            font.pixelSize: 10
-                            validator: DoubleValidator { bottom: 0; decimals: 2 }
-                            onEditingFinished: root.applyBoundary("end", text)
-                            background: Rectangle {
-                                radius: Theme.radiusSmall
-                                color: Theme.navigation
-                                border.color: endField.activeFocus ? Theme.accent : Theme.border
-                            }
-                        }
-                        CompactButton {
-                            Layout.preferredWidth: 48
-                            text: "−0.5"
-                            enabled: root.activeIndex >= 0
-                            onClicked: root.nudgeBoundary("end", -0.5)
-                        }
-                        CompactButton {
-                            Layout.preferredWidth: 48
-                            text: "+0.5"
-                            enabled: root.activeIndex >= 0
-                            onClicked: root.nudgeBoundary("end", 0.5)
-                        }
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                ColumnLayout {
-                    Layout.preferredWidth: 150
-                    spacing: 4
                     Text {
-                        text: root.activeIndex >= 0
-                              ? qsTr("原始边界  %1–%2")
-                                .arg(root.formatSeconds(assemblyModel.get(root.activeIndex).originalStartSeconds))
-                                .arg(root.formatSeconds(assemblyModel.get(root.activeIndex).originalEndSeconds))
-                              : qsTr("原始边界  —")
+                        text: qsTr("导出画质")
                         color: Theme.textMuted
                         font.pixelSize: 9
                     }
-                    CompactButton {
-                        Layout.fillWidth: true
-                        text: qsTr("恢复原始边界")
-                        enabled: root.activeIndex >= 0
-                        onClicked: root.restoreActiveBoundary()
+
+                    ComboBox {
+                        id: qualityBox
+                        Layout.preferredWidth: 148
+                        Layout.preferredHeight: 30
+                        model: root.qualityOptions
+                        textRole: "label"
+                        valueRole: "code"
+                        onCurrentValueChanged: root.exportQuality = currentValue
                     }
+
+                    // 单回合导出：用上面微调过的边界，从原始素材重新截取（带音轨）
+                    Button {
+                        Layout.preferredWidth: 130
+                        Layout.preferredHeight: 30
+                        enabled: root.activeIndex >= 0 && !root.analyzer.exporting
+                        text: root.analyzer.exporting ? qsTr("正在导出…") : qsTr("导出本回合")
+                        onClicked: root.exportActiveRow()
+                        contentItem: Text {
+                            text: parent.text
+                            color: parent.enabled ? Theme.accentText : Theme.textDim
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                            font.pixelSize: 11
+                            font.weight: Font.DemiBold
+                        }
+                        background: Rectangle {
+                            radius: Theme.radiusSmall
+                            color: parent.enabled ? Theme.accent : Theme.panelRaised
+                            border.color: parent.enabled ? Theme.accent : Theme.border
+                        }
+                    }
+
                     Text {
-                        text: qsTr("三击右侧回合卡片编辑备注")
-                        color: Theme.textDim
-                        font.pixelSize: 8
+                        Layout.fillWidth: true
+                        text: root.analyzer.exporting
+                              ? qsTr("正在导出 · %1%").arg(Math.round(root.analyzer.exportProgress * 100))
+                              : root.analyzer.actionMessage
+                        color: root.analyzer.exporting ? Theme.accent : Theme.textMuted
+                        elide: Text.ElideMiddle
+                        font.pixelSize: 9
                     }
                 }
             }

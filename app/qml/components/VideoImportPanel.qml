@@ -387,7 +387,7 @@ Item {
                     Layout.preferredWidth: 142
                     Layout.preferredHeight: 42
                     enabled: root.importer.ready
-                    text: qsTr("进入切分试验")
+                    text: qsTr("开始回合分析")
                     onClicked: root.continueRequested()
 
                     contentItem: Text {

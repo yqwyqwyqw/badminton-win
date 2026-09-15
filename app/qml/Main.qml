@@ -33,7 +33,9 @@ ApplicationWindow {
                      ? videoImporter.fileName
                      : qsTr("尚未导入素材")
         statusText: window.currentStep === 0
-                    ? videoImporter.statusText
+                    ? (trialAnalyzer.actionMessage.length > 0
+                       ? trialAnalyzer.actionMessage
+                       : videoImporter.statusText)
                     : (window.currentStep === 1 || window.currentStep === 2
                        ? trialAnalyzer.stageText
                        : qsTr("等待拼接结果导出"))
