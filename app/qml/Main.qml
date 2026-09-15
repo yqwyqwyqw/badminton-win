@@ -15,8 +15,9 @@ ApplicationWindow {
     title: qsTr("羽毛球回合分析器")
     font.family: "Microsoft YaHei UI"
 
-    property int currentStep: 1
+    property int currentStep: 0
     property int selectedRally: 0
+    property int selectedTrialRally: 0
     property bool analysisPaused: false
 
     ListModel {
@@ -30,9 +31,24 @@ ApplicationWindow {
     }
 
     header: AppHeader {
-        projectName: qsTr("序列1 · 演示工程")
-        statusText: analysisPaused ? qsTr("分析已暂停") : qsTr("正在分析 · 38%")
-        statusActive: !analysisPaused
+        projectName: videoImporter.hasVideo
+                     ? videoImporter.fileName
+                     : qsTr("尚未导入素材")
+        statusText: window.currentStep === 0
+                    ? videoImporter.statusText
+                    : (window.currentStep === 1
+                       ? trialAnalyzer.stageText
+                       : (analysisPaused ? qsTr("分析已暂停") : qsTr("正在分析 · 38%")))
+        statusActive: window.currentStep === 0
+                      ? videoImporter.ready
+                      : (window.currentStep === 1
+                         ? trialAnalyzer.state !== "error"
+                         : !analysisPaused)
+        onNewProjectRequested: {
+            trialAnalyzer.reset()
+            videoImporter.clear()
+            window.currentStep = 0
+        }
     }
 
     RowLayout {
@@ -51,10 +67,28 @@ ApplicationWindow {
             Layout.fillHeight: true
             color: Theme.window
 
+            VideoImportPanel {
+                anchors.fill: parent
+                anchors.margins: 20
+                visible: window.currentStep === 0
+                importer: videoImporter
+                onContinueRequested: window.currentStep = 1
+            }
+
+            CutTrialPanel {
+                anchors.fill: parent
+                anchors.margins: 20
+                visible: window.currentStep === 1
+                importer: videoImporter
+                analyzer: trialAnalyzer
+                selectedRally: window.selectedTrialRally
+            }
+
             ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 20
                 spacing: 14
+                visible: window.currentStep >= 2
 
                 AnalysisStatusCard {
                     Layout.fillWidth: true
@@ -84,6 +118,7 @@ ApplicationWindow {
         RallyListPanel {
             Layout.preferredWidth: 340
             Layout.fillHeight: true
+            visible: window.currentStep >= 2
             model: rallyModel
             selectedIndex: window.selectedRally
             onRallySelected: function(index) { window.selectedRally = index }
@@ -91,6 +126,15 @@ ApplicationWindow {
                 rallyModel.setProperty(index, "effectiveHits", count)
                 rallyModel.setProperty(index, "reviewState", "已人工修正")
             }
+        }
+
+        TrialRallyPanel {
+            Layout.preferredWidth: 340
+            Layout.fillHeight: true
+            visible: window.currentStep === 1
+            analyzer: trialAnalyzer
+            selectedIndex: window.selectedTrialRally
+            onRallySelected: function(index) { window.selectedTrialRally = index }
         }
     }
 }

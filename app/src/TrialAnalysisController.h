@@ -1,0 +1,100 @@
+#pragma once
+
+#include <QObject>
+#include <QProcess>
+#include <QTimer>
+#include <QUrl>
+#include <QVariantList>
+
+class TrialAnalysisController final : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool running READ running NOTIFY changed)
+    Q_PROPERTY(bool hasResults READ hasResults NOTIFY changed)
+    Q_PROPERTY(bool proxyReady READ proxyReady NOTIFY changed)
+    Q_PROPERTY(double progress READ progress NOTIFY changed)
+    Q_PROPERTY(QString state READ state NOTIFY changed)
+    Q_PROPERTY(QString stageText READ stageText NOTIFY changed)
+    Q_PROPERTY(QString detailText READ detailText NOTIFY changed)
+    Q_PROPERTY(QString etaText READ etaText NOTIFY changed)
+    Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY changed)
+    Q_PROPERTY(QString actionMessage READ actionMessage NOTIFY changed)
+    Q_PROPERTY(QString outputDirectory READ outputDirectory NOTIFY changed)
+    Q_PROPERTY(int rallyCount READ rallyCount NOTIFY changed)
+    Q_PROPERTY(QVariantList rallies READ rallies NOTIFY changed)
+    Q_PROPERTY(QUrl proxyUrl READ proxyUrl NOTIFY changed)
+
+public:
+    explicit TrialAnalysisController(QObject *parent = nullptr);
+
+    bool running() const { return m_process.state() != QProcess::NotRunning; }
+    bool hasResults() const { return !m_rallies.isEmpty(); }
+    bool proxyReady() const;
+    double progress() const { return m_progress; }
+    QString state() const { return m_state; }
+    QString stageText() const { return m_stageText; }
+    QString detailText() const { return m_detailText; }
+    QString etaText() const { return m_etaText; }
+    QString errorMessage() const { return m_errorMessage; }
+    QString actionMessage() const { return m_actionMessage; }
+    QString outputDirectory() const { return m_outputDirectory; }
+    int rallyCount() const { return m_rallies.size(); }
+    QVariantList rallies() const { return m_rallies; }
+    QUrl proxyUrl() const;
+
+    Q_INVOKABLE void startTrial(const QString &sourcePath, qint64 sourceDurationMs, int maxRallies);
+    Q_INVOKABLE void cancel();
+    Q_INVOKABLE void reset();
+    Q_INVOKABLE QUrl clipUrl(int index) const;
+    Q_INVOKABLE bool exportRally(int index, const QUrl &folderUrl);
+    Q_INVOKABLE void openOutputFolder() const;
+
+signals:
+    void changed();
+
+private:
+    enum class Stage { Idle, Proxy, Inference, Complete, Paused, Error };
+
+    void configurePaths(const QString &sourcePath);
+    void startProxy(bool softwareFallback);
+    void startInference();
+    void readProcessOutput();
+    void readProcessError();
+    void processLine(const QString &line);
+    void processFinished(int exitCode, QProcess::ExitStatus exitStatus);
+    void refreshFiles();
+    void loadProgress();
+    void loadRallies();
+    void fail(const QString &message);
+    void appendLog(const QString &text);
+    static QString discoverProjectRoot();
+    static QString formatSeconds(double seconds);
+
+    QProcess m_process;
+    QTimer m_refreshTimer;
+    Stage m_stage = Stage::Idle;
+    QString m_state = QStringLiteral("idle");
+    QString m_stageText = QStringLiteral("等待开始切分试验");
+    QString m_detailText = QStringLiteral("将只分析指定数量的前几个回合");
+    QString m_etaText;
+    QString m_errorMessage;
+    QString m_actionMessage;
+    QString m_logTail;
+    QString m_projectRoot;
+    QString m_sourcePath;
+    QString m_outputDirectory;
+    QString m_proxyPath;
+    QString m_proxyTemporaryPath;
+    QString m_analysisDirectory;
+    QString m_ffmpegPath;
+    QString m_pythonPath;
+    QString m_runnerPath;
+    QString m_modelPath;
+    QString m_vendorPath;
+    qint64 m_sourceDurationMs = 0;
+    int m_maxRallies = 5;
+    double m_progress = 0.0;
+    bool m_proxySoftwareFallback = false;
+    bool m_cancelRequested = false;
+    QVariantList m_rallies;
+};

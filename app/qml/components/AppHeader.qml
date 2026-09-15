@@ -9,6 +9,7 @@ ToolBar {
     required property string projectName
     required property string statusText
     property bool statusActive: true
+    signal newProjectRequested()
 
     height: 66
     padding: 0
@@ -98,6 +99,7 @@ ToolBar {
             text: qsTr("新建项目")
             implicitWidth: 92
             implicitHeight: 34
+            onClicked: root.newProjectRequested()
 
             contentItem: Text {
                 text: parent.text
